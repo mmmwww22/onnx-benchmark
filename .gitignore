@@ -1,0 +1,9 @@
+# Python environment and cache
+.venv/
+__pycache__/
+*.py[cod]
+
+# Generated model and benchmark outputs
+*.onnx
+*.onnx.data
+inference_benchmark_results.csv
