@@ -49,7 +49,7 @@
 克隆仓库：
 
 ```bash
-git clone <你的仓库地址>
+git clone https://github.com/mmmwww22/onnx-benchmark.git
 cd onnx-benchmark
 ```
 
