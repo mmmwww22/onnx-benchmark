@@ -4,6 +4,7 @@ __pycache__/
 *.py[cod]
 
 # Generated model and benchmark outputs
+results/
 *.onnx
 *.onnx.data
 inference_benchmark_results.csv

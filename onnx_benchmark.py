@@ -1,10 +1,19 @@
-"""PyTorch -> ONNX -> ONNX Runtime 的可配置端到端推理脚本。"""
+"""可复现配置的 PyTorch -> ONNX -> ONNX Runtime CPU 推理实验。"""
 
 import argparse
 import csv
-import statistics
-import time
+from datetime import datetime
+import hashlib
+import json
+import logging
+import os
 from pathlib import Path
+import platform
+import random
+import statistics
+import sys
+import time
+import uuid
 
 import numpy as np
 import onnx
@@ -14,279 +23,326 @@ import torchvision
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-DEVICE = torch.device("cpu")
-DEFAULT_BATCH_SIZES = [1, 8, 32]
-DEFAULT_WARMUP = 10
-DEFAULT_REPEATS = 100
-
-# 这是当前作业的固定对比模型组；--models 只允许从此列表中选择。
 MODELS = {
-    "resnet18": (
-        torchvision.models.resnet18,
-        torchvision.models.ResNet18_Weights.DEFAULT,
-    ),
-    "mobilenet_v2": (
-        torchvision.models.mobilenet_v2,
-        torchvision.models.MobileNet_V2_Weights.DEFAULT,
-    ),
+    "resnet18": (torchvision.models.resnet18, torchvision.models.ResNet18_Weights.DEFAULT),
+    "mobilenet_v2": (torchvision.models.mobilenet_v2, torchvision.models.MobileNet_V2_Weights.DEFAULT),
     "shufflenet_v2_x1_0": (
         torchvision.models.shufflenet_v2_x1_0,
         torchvision.models.ShuffleNet_V2_X1_0_Weights.DEFAULT,
     ),
 }
+RESULT_FIELDS = [
+    "Model", "Framework", "Batch Size", "Latency (ms)", "Throughput (img/s)",
+    "Round", "Median (ms)", "P95 (ms)", "Std (ms)", "Threads", "Warmup", "Repeats",
+]
+RAW_FIELDS = ["Model", "Framework", "Batch Size", "Round", "Iteration", "Latency (ms)"]
+VALIDATION_FIELDS = [
+    "Model", "Batch Size", "PyTorch Shape", "ORT Shape", "Max Abs Error",
+    "Mean Abs Error", "All Close", "Predictions Equal", "Finite", "Passed",
+]
+COMPARISON_FIELDS = [
+    "Model", "Batch Size", "Round", "PyTorch Mean (ms)", "ORT Mean (ms)",
+    "ORT Speedup (mean)", "ORT Speedup (median)",
+]
 
 
-def positive_int(value: str) -> int:
-    """供 argparse 使用：只接受大于 0 的整数。"""
+def positive_int(value):
     number = int(value)
     if number <= 0:
         raise argparse.ArgumentTypeError("必须是大于 0 的整数")
     return number
 
 
-def non_negative_int(value: str) -> int:
-    """供 argparse 使用：只接受大于等于 0 的整数。"""
+def non_negative_int(value):
     number = int(value)
     if number < 0:
         raise argparse.ArgumentTypeError("必须是大于等于 0 的整数")
     return number
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="导出指定 CNN 模型为 ONNX，并使用 ONNX Runtime 校验和测速。"
-    )
-    parser.add_argument(
-        "--models",
-        nargs="+",
-        choices=list(MODELS),
-        default=list(MODELS),
-        help="要运行的模型，可选多个；默认运行全部模型。",
-    )
-    parser.add_argument(
-        "--batches",
-        nargs="+",
-        type=positive_int,
-        default=DEFAULT_BATCH_SIZES,
-        help="要测试的 batch size；默认：1 8 32。",
-    )
-    parser.add_argument(
-        "--warmup",
-        type=non_negative_int,
-        default=DEFAULT_WARMUP,
-        help="每种 batch 的预热次数；默认：10。",
-    )
-    parser.add_argument(
-        "--repeats",
-        type=positive_int,
-        default=DEFAULT_REPEATS,
-        help="每种 batch 的正式测速次数；默认：100。",
-    )
-    return parser.parse_args()
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--models", nargs="+", choices=list(MODELS), default=list(MODELS))
+    parser.add_argument("--batches", nargs="+", type=positive_int, default=[1, 8, 32])
+    parser.add_argument("--warmup", type=non_negative_int, default=10)
+    parser.add_argument("--repeats", type=positive_int, default=100)
+    parser.add_argument("--threads", type=positive_int, default=min(4, os.cpu_count() or 1),
+                        help="两框架的算子内线程数；默认最多 4，算子间线程数固定为 1")
+    parser.add_argument("--seed", type=non_negative_int, default=42)
+    parser.add_argument("--rounds", type=positive_int, default=1,
+                        help="每种模型/batch 的测试轮数，每轮交替测试框架顺序")
+    parser.add_argument("--output-dir", type=Path, default=PROJECT_DIR / "results",
+                        help="结果根目录，每次运行自动创建独立子目录")
+    args = parser.parse_args(argv)
+    args.models = list(dict.fromkeys(args.models))
+    args.batches = list(dict.fromkeys(args.batches))
+    return args
 
 
-def load_model(model_fn, weights):
-    model = model_fn(weights=weights)
-    model.eval()
-    return model.to(DEVICE)
+def now():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def export_onnx(model: torch.nn.Module, name: str) -> Path:
-    dummy_input = torch.randn(1, 3, 224, 224, device=DEVICE)
-    onnx_path = PROJECT_DIR / f"{name}.onnx"
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed % (2 ** 32))
+    torch.manual_seed(seed % (2 ** 63))
+
+
+def atomic_json(path, value):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False),
+                         encoding="utf-8")
+    temporary.replace(path)
+
+
+def atomic_csv(path, fields, rows):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary.replace(path)
+
+
+def make_comparisons(results):
+    grouped = {}
+    for row in results:
+        key = (row["Model"], row["Batch Size"], row["Round"])
+        grouped.setdefault(key, {})[row["Framework"]] = row
+    comparisons = []
+    for (name, batch, round_number), pair in grouped.items():
+        if "PyTorch" not in pair or "ONNX Runtime" not in pair:
+            continue
+        pytorch, ort_row = pair["PyTorch"], pair["ONNX Runtime"]
+        comparisons.append({
+            "Model": name, "Batch Size": batch, "Round": round_number,
+            "PyTorch Mean (ms)": pytorch["Latency (ms)"],
+            "ORT Mean (ms)": ort_row["Latency (ms)"],
+            "ORT Speedup (mean)": pytorch["Latency (ms)"] / ort_row["Latency (ms)"],
+            "ORT Speedup (median)": pytorch["Median (ms)"] / ort_row["Median (ms)"],
+        })
+    return comparisons
+
+
+def save_progress(run_dir, metadata, results, validations, raw_times):
+    atomic_csv(run_dir / "inference_benchmark_results.csv", RESULT_FIELDS, results)
+    atomic_csv(run_dir / "validation_results.csv", VALIDATION_FIELDS, validations)
+    atomic_csv(run_dir / "raw_timings.csv", RAW_FIELDS, raw_times)
+    atomic_csv(run_dir / "comparisons.csv", COMPARISON_FIELDS, make_comparisons(results))
+    metadata["recorded_results"] = len(results)
+    metadata["updated_at"] = now()
+    atomic_json(run_dir / "experiment.json", metadata)
+
+
+def export_onnx(model, name, model_dir):
+    path = model_dir / f"{name}.onnx"
     torch.onnx.export(
-        model,
-        dummy_input,
-        str(onnx_path),
-        input_names=["input"],
-        output_names=["output"],
-        opset_version=18,
+        model, torch.randn(1, 3, 224, 224), str(path),
+        input_names=["input"], output_names=["output"], opset_version=18,
         dynamo=False,
-        dynamic_axes={
-            "input": {0: "batch_size"},
-            "output": {0: "batch_size"},
-        },
+        dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
     )
-
-    onnx_model = onnx.load(str(onnx_path))
-    onnx.checker.check_model(onnx_model)
-    print(f"{name} ONNX 导出并检查成功")
-    return onnx_path
+    onnx.checker.check_model(onnx.load(str(path)))
+    logging.info("%s ONNX 导出并检查成功", name)
+    return path
 
 
-def create_session(onnx_path: Path):
-    session = ort.InferenceSession(
-        str(onnx_path), providers=["CPUExecutionProvider"]
-    )
-    input_info = session.get_inputs()[0]
-    output_info = session.get_outputs()[0]
-    print("ONNX 输入名称：", input_info.name)
-    print("ONNX 输入形状：", input_info.shape)
-    print("ONNX 输出名称：", output_info.name)
-    return session, input_info.name, output_info.name
+def create_session(path, threads):
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = threads
+    options.inter_op_num_threads = 1
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    # ORT 空闲时不忙等，减少其线程池对随后 PyTorch 测速的干扰。
+    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    session = ort.InferenceSession(str(path), sess_options=options,
+                                   providers=["CPUExecutionProvider"])
+    if session.get_providers()[0] != "CPUExecutionProvider":
+        raise RuntimeError("未使用预期的 CPUExecutionProvider")
+    return session
 
 
-def compare_outputs(
-    model: torch.nn.Module,
-    input_name: str,
-    output_name: str,
-    session: ort.InferenceSession,
-    model_name: str,
-) -> None:
-    test_input = torch.randn(1, 3, 224, 224, device=DEVICE)
+def compare_outputs(model, session, x, name, batch):
     with torch.inference_mode():
-        pytorch_output = model(test_input).cpu().numpy()
-
-    onnx_output = session.run(
-        [output_name], {input_name: test_input.cpu().numpy()}
-    )[0]
-    max_error = np.max(np.abs(onnx_output - pytorch_output))
-    is_close = np.allclose(pytorch_output, onnx_output, rtol=1e-3, atol=1e-3)
-
-    print(f"{model_name} PyTorch 输出形状：{pytorch_output.shape}")
-    print(f"{model_name} ORT 输出形状：{onnx_output.shape}")
-    print(f"最大绝对误差：{max_error:.8f}")
-    print(f"输出是否基本一致：{is_close}")
-    if not is_close:
-        raise ValueError(f"{model_name} 的 PyTorch 与 ORT 输出不一致")
-    print("输出验证通过\n")
-
-
-def benchmark_ort(
-    batch: int,
-    session: ort.InferenceSession,
-    input_name: str,
-    model_name: str,
-    warmup: int,
-    repeats: int,
-) -> dict:
-    dummy_input = torch.randn(batch, 3, 224, 224).numpy()
-    for _ in range(warmup):
-        session.run(None, {input_name: dummy_input})
-
-    times = []
-    for _ in range(repeats):
-        start_time = time.perf_counter()
-        session.run(None, {input_name: dummy_input})
-        times.append(time.perf_counter() - start_time)
-
-    average_time = statistics.mean(times)
-    latency = average_time * 1000
-    throughput = batch / average_time
-    print(
-        f"ONNX Runtime | Batch={batch:2d} | Latency={latency:.3f} ms | "
-        f"Throughput={throughput:.2f} img/s"
-    )
+        pytorch_output = model(x).numpy()
+    ort_output = session.run(None, {session.get_inputs()[0].name: x.numpy()})[0]
+    shape_matches = pytorch_output.shape == ort_output.shape
+    finite = bool(np.isfinite(pytorch_output).all() and np.isfinite(ort_output).all())
+    max_error = mean_error = None
+    is_close = predictions_equal = False
+    if shape_matches and finite:
+        diff = np.abs(pytorch_output - ort_output)
+        max_error, mean_error = float(diff.max()), float(diff.mean())
+        is_close = bool(np.allclose(pytorch_output, ort_output, rtol=1e-3, atol=1e-3))
+        predictions_equal = bool((pytorch_output.argmax(1) == ort_output.argmax(1)).all())
+    passed = shape_matches and finite and is_close
+    logging.info("%s batch=%d 输出验证：%s | max_abs_error=%s | 预测一致=%s",
+                 name, batch, passed, max_error, predictions_equal)
     return {
-        "Model": model_name,
-        "Framework": "ONNX Runtime",
-        "Batch Size": batch,
-        "Latency (ms)": round(latency, 3),
-        "Throughput (img/s)": round(throughput, 2),
+        "Model": name, "Batch Size": batch,
+        "PyTorch Shape": str(list(pytorch_output.shape)), "ORT Shape": str(list(ort_output.shape)),
+        "Max Abs Error": max_error, "Mean Abs Error": mean_error,
+        "All Close": is_close, "Predictions Equal": predictions_equal,
+        "Finite": finite, "Passed": passed,
     }
 
 
-def benchmark_pytorch(
-    batch: int,
-    model: torch.nn.Module,
-    model_name: str,
-    warmup: int,
-    repeats: int,
-) -> dict:
-    """在 CPU 上测量 PyTorch 模型的纯前向推理时间。"""
-    dummy_input = torch.randn(batch, 3, 224, 224, device=DEVICE)
+def benchmark(run, warmup, repeats):
+    # 输入生成、格式转换、校验和写文件均在计时区间之外。
     with torch.inference_mode():
         for _ in range(warmup):
-            model(dummy_input)
-
-        times = []
+            run()
+        times_ms = []
         for _ in range(repeats):
-            start_time = time.perf_counter()
-            model(dummy_input)
-            times.append(time.perf_counter() - start_time)
+            start = time.perf_counter_ns()
+            run()
+            elapsed = (time.perf_counter_ns() - start) / 1_000_000
+            if elapsed <= 0 or not np.isfinite(elapsed):
+                raise RuntimeError("无效计时样本")
+            times_ms.append(elapsed)
+    return times_ms
 
-    average_time = statistics.mean(times)
-    latency = average_time * 1000
-    throughput = batch / average_time
-    print(
-        f"PyTorch | Batch={batch:2d} | Latency={latency:.3f} ms | "
-        f"Throughput={throughput:.2f} img/s"
-    )
+
+def summarize(times_ms, name, framework, batch, round_number, args):
+    mean_ms = statistics.mean(times_ms)
     return {
-        "Model": model_name,
-        "Framework": "PyTorch",
-        "Batch Size": batch,
-        "Latency (ms)": round(latency, 3),
-        "Throughput (img/s)": round(throughput, 2),
+        "Model": name, "Framework": framework, "Batch Size": batch,
+        "Latency (ms)": mean_ms,
+        "Throughput (img/s)": batch * len(times_ms) * 1000 / sum(times_ms),
+        "Round": round_number, "Median (ms)": statistics.median(times_ms),
+        "P95 (ms)": float(np.percentile(times_ms, 95, method="linear")),
+        "Std (ms)": statistics.pstdev(times_ms),
+        "Threads": args.threads, "Warmup": args.warmup, "Repeats": args.repeats,
     }
 
 
-def save_results(results: list[dict]) -> Path:
-    csv_path = PROJECT_DIR / "inference_benchmark_results.csv"
-    fieldnames = [
-        "Model",
-        "Framework",
-        "Batch Size",
-        "Latency (ms)",
-        "Throughput (img/s)",
-    ]
-    with csv_path.open("w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(results)
-    print(f"\n测速结果保存至：{csv_path}")
-    return csv_path
-
-
-def main() -> int:
-    args = parse_args()
-    print("运行配置：")
-    print(f"  模型：{', '.join(args.models)}")
-    print(f"  Batch Size：{args.batches}")
-    print(f"  预热次数：{args.warmup}")
-    print(f"  正式测速次数：{args.repeats}\n")
-
-    results = []
-    failed_models = []
-    for model_name in args.models:
-        model_fn, weights = MODELS[model_name]
-        try:
-            model = load_model(model_fn, weights)
-            onnx_path = export_onnx(model, model_name)
-            session, input_name, output_name = create_session(onnx_path)
-            compare_outputs(model, input_name, output_name, session, model_name)
-            for batch in args.batches:
-                results.append(
-                    benchmark_pytorch(
-                        batch,
-                        model,
-                        model_name,
-                        args.warmup,
-                        args.repeats,
-                    )
-                )
-                results.append(
-                    benchmark_ort(
-                        batch,
-                        session,
-                        input_name,
-                        model_name,
-                        args.warmup,
-                        args.repeats,
-                    )
-                )
-        except Exception as error:
-            failed_models.append(model_name)
-            print(f"{model_name} 处理失败：{error}")
-
-    save_results(results)
-    print(f"成功记录的测速条数：{len(results)}")
-    if failed_models:
-        print(f"失败模型：{', '.join(failed_models)}")
-        return 1
-
-    print("全部模型处理流程结束")
-    return 0
+def main(argv=None):
+    args = parse_args(argv)
+    # 必须在模型执行前设置。每次 CLI 运行使用独立进程。
+    torch.set_num_threads(args.threads)
+    torch.set_num_interop_threads(1)
+    set_seed(args.seed)
+    args.output_dir = args.output_dir.expanduser().resolve()
+    run_dir = args.output_dir / (datetime.now().strftime("%Y%m%d_%H%M%S_%f") + "_" + uuid.uuid4().hex[:8])
+    model_dir = run_dir / "models"
+    model_dir.mkdir(parents=True, exist_ok=False)
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True,
+        handlers=[logging.StreamHandler(sys.stdout),
+                  logging.FileHandler(run_dir / "run.log", encoding="utf-8")],
+    )
+    logging.captureWarnings(True)
+    metadata = {
+        "schema_version": 1, "run_id": run_dir.name, "status": "running",
+        "started_at": now(), "finished_at": None,
+        "configuration": {**vars(args), "output_dir": str(args.output_dir)},
+        "environment": {
+            "python": sys.version, "python_executable": sys.executable,
+            "os": platform.platform(), "cpu": platform.processor() or os.environ.get("PROCESSOR_IDENTIFIER", "unknown"),
+            "logical_cpu_count": os.cpu_count(), "torch": torch.__version__,
+            "torchvision": torchvision.__version__, "onnx": onnx.__version__,
+            "onnxruntime": ort.__version__, "numpy": np.__version__,
+            "pytorch_intra_op_threads": torch.get_num_threads(),
+            "pytorch_inter_op_threads": torch.get_num_interop_threads(),
+        },
+        "protocol": {
+            "device": "cpu", "dtype": "float32", "input_shape": ["batch", 3, 224, 224],
+            "timing": "CPU forward wall-clock time; excludes export, validation, input creation and file IO",
+            "rtol": 1e-3, "atol": 1e-3, "std": "population", "p95": "linear interpolation",
+            "ort_intra_op_threads": args.threads, "ort_inter_op_threads": 1,
+            "ort_execution_mode": "ORT_SEQUENTIAL", "ort_graph_optimization": "ORT_ENABLE_ALL",
+            "ort_intra_op_allow_spinning": False,
+        },
+        "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "expected_results": len(args.models) * len(args.batches) * args.rounds * 2,
+        "models": {}, "execution_order": [], "failures": [],
+    }
+    results, validations, raw_times = [], [], []
+    save = lambda: save_progress(run_dir, metadata, results, validations, raw_times)
+    save()
+    logging.info("结果目录：%s", run_dir)
+    logging.info("模型=%s | batch=%s | 线程=%d | 预热=%d | 测速=%d | 轮数=%d | seed=%d",
+                 args.models, args.batches, args.threads, args.warmup, args.repeats, args.rounds, args.seed)
+    exit_code = 0
+    model = session = None
+    try:
+        for name in args.models:
+            model_state = metadata["models"][name] = {"status": "running", "stage": "load"}
+            try:
+                # 模型单独选择或调整排列时，也保持该模型的输入随机序列一致。
+                model_seed = args.seed + list(MODELS).index(name)
+                set_seed(model_seed)
+                model_fn, weights = MODELS[name]
+                model_state.update({"seed": model_seed, "weights": str(weights)})
+                model = model_fn(weights=weights).eval().cpu()
+                model_state["stage"] = "export"
+                path = export_onnx(model, name, model_dir)
+                model_state["onnx_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+                model_state["stage"] = "session"
+                session = create_session(path, args.threads)
+                model_state["providers"] = session.get_providers()
+                for batch_index, batch in enumerate(args.batches):
+                    generator = torch.Generator().manual_seed((model_seed + batch) % (2 ** 63))
+                    x = torch.randn(batch, 3, 224, 224, generator=generator)
+                    model_state.update({"stage": "validation", "batch": batch})
+                    validation = compare_outputs(model, session, x, name, batch)
+                    validations.append(validation)
+                    save()
+                    if not validation["Passed"]:
+                        raise ValueError(f"{name} batch={batch} 输出校验失败，跳过该模型剩余测速")
+                    feed = {session.get_inputs()[0].name: x.numpy()}
+                    runners = {"PyTorch": lambda: model(x),
+                               "ONNX Runtime": lambda: session.run(None, feed)}
+                    for round_number in range(1, args.rounds + 1):
+                        order = list(runners)
+                        if (batch_index + round_number - 1) % 2:
+                            order.reverse()
+                        metadata["execution_order"].append({
+                            "model": name, "batch": batch, "round": round_number, "frameworks": order,
+                        })
+                        for framework in order:
+                            model_state.update({"stage": "benchmark", "round": round_number, "framework": framework})
+                            save()
+                            times_ms = benchmark(runners[framework], args.warmup, args.repeats)
+                            row = summarize(times_ms, name, framework, batch, round_number, args)
+                            results.append(row)
+                            raw_times.extend({
+                                "Model": name, "Framework": framework, "Batch Size": batch,
+                                "Round": round_number, "Iteration": i, "Latency (ms)": elapsed,
+                            } for i, elapsed in enumerate(times_ms, 1))
+                            save()
+                            logging.info("%s | %s | batch=%d round=%d | mean=%.3f ms median=%.3f ms P95=%.3f ms | %.2f img/s",
+                                         name, framework, batch, round_number, row["Latency (ms)"],
+                                         row["Median (ms)"], row["P95 (ms)"], row["Throughput (img/s)"])
+                model_state["status"] = "completed"
+            except Exception as error:
+                model_state.update({"status": "failed", "error": str(error), "error_type": type(error).__name__})
+                metadata["failures"].append({"model": name, "stage": model_state["stage"], "error": str(error)})
+                logging.exception("%s 处理失败，保留已完成结果，继续其他模型", name)
+            finally:
+                model = session = None
+                save()
+        if metadata["failures"] or len(results) != metadata["expected_results"]:
+            metadata["status"], exit_code = "failed", 1
+        else:
+            metadata["status"] = "completed"
+    except KeyboardInterrupt:
+        metadata["status"], exit_code = "interrupted", 130
+        for state in metadata["models"].values():
+            if state["status"] == "running":
+                state["status"] = "interrupted"
+        logging.warning("用户中断；已完成的配置已保存，当前未完成的计时组不计入结果")
+    except Exception as error:
+        metadata["status"], exit_code = "failed", 1
+        metadata["failures"].append({"model": None, "stage": "run", "error": str(error)})
+        logging.exception("实验失败")
+    finally:
+        metadata["finished_at"] = now()
+        save()
+        logging.info("实验状态=%s | 记录=%d/%d | 结果目录=%s",
+                     metadata["status"], len(results), metadata["expected_results"], run_dir)
+    return exit_code
 
 
 if __name__ == "__main__":
